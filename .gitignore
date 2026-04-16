@@ -1,0 +1,22 @@
+# 忽略当前项目 CMake 生成的构建目录
+build/
+out/
+CMakeCache.txt
+CMakeFiles/
+*.cmake
+install_manifest.txt
+
+# 忽略 Visual Studio 产生的工程文件
+.vs/
+*.sln
+*.vcxproj
+*.vcxproj.user
+*.vcxproj.filters
+
+# 忽略编译产生的二进制和调试文件
+*.exe
+*.dll
+*.lib
+*.pdb
+*.obj
+*.ilk
