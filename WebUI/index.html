@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>C++ WebIM 极简版</title>
+    <style>
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #e9eaed; margin: 0; padding: 20px; display: flex; justify-content: center;}
+        .container { width: 800px; background: white; border-radius: 10px; box-shadow: 0 4px 10px rgba(0,0,0,0.1); overflow: hidden; display: flex; flex-direction: column; height: 80vh; }
+        
+        /* 顶部状态栏 */
+        .header { background: #1890ff; color: white; padding: 15px 20px; font-weight: bold; display: flex; justify-content: space-between; align-items: center;}
+        
+        /* 聊天区域 */
+        #chatBox { flex: 1; padding: 20px; overflow-y: auto; background: #f5f5f5; display: flex; flex-direction: column; }
+        
+        /* 基础消息容器 */
+        .msg-row { display: flex; margin-bottom: 15px; width: 100%; }
+        .msg-content { max-width: 60%; display: flex; flex-direction: column; }
+        
+        /* 文字头像 */
+        .text-avatar { width: 40px; height: 40px; border-radius: 50%; background: #ccc; color: white; display: flex; align-items: center; justify-content: center; font-weight: bold; font-size: 18px; flex-shrink: 0; }
+        
+        /* 气泡和时间 */
+        .bubble { padding: 10px 15px; border-radius: 8px; margin-top: 4px; word-wrap: break-word; position: relative;}
+        .meta-text { font-size: 12px; color: #888; margin-bottom: 2px; }
+
+        /* 别人发的消息 (居左) */
+        .row-other { justify-content: flex-start; }
+        .row-other .text-avatar { margin-right: 10px; background: #90caf9; }
+        .row-other .bubble { background: white; border: 1px solid #e0e0e0; border-top-left-radius: 0; }
+        .row-other .meta-text { text-align: left; }
+
+        /* 我发的消息 (居右) */
+        .row-me { justify-content: flex-end; }
+        .row-me .text-avatar { margin-left: 10px; background: #1890ff; }
+        .row-me .bubble { background: #e6f7ff; border: 1px solid #91d5ff; border-top-right-radius: 0; }
+        .row-me .meta-text { text-align: right; }
+
+        /* 底部输入框 */
+        .input-area { padding: 15px; background: white; border-top: 1px solid #eee; display: flex; gap: 10px; }
+        input[type="text"] { flex: 1; padding: 10px; border: 1px solid #ddd; border-radius: 4px; outline: none; }
+        input[type="text"].small { flex: 0.3; }
+        button { padding: 10px 20px; background: #1890ff; color: white; border: none; border-radius: 4px; cursor: pointer; font-weight: bold; }
+        button:hover { background: #40a9ff; }
+    </style>
+</head>
+<body>
+    <div class="container" id="loginArea" style="height: auto; align-items: center; padding: 50px;">
+        <h2>欢迎使用 C++ WebIM</h2>
+        <input type="text" id="myUsername" placeholder="请输入你的名字 (如: UserA)" style="width: 200px; margin-bottom: 20px;">
+        <button onclick="login()">连接服务器</button>
+    </div>
+
+    <div class="container" id="chatArea" style="display:none;">
+        <div class="header">
+            <span id="headerName">当前用户: 未知</span>
+            <span style="font-size: 12px; font-weight: normal;">已连接</span>
+        </div>
+        
+        <div id="chatBox">
+            </div>
+
+        <div class="input-area">
+            <input type="text" id="targetUser" class="small" placeholder="发给谁? (如: UserB)">
+            <input type="text" id="msgContent" placeholder="说点什么...">
+            <button onclick="sendMessage()">发送</button>
+        </div>
+    </div>
+
+    <script>
+        let ws;
+        let currentUser = "";
+
+        // 获取当前时间 (HH:MM:SS)
+        function getCurrentTime() {
+            return new Date().toLocaleTimeString('zh-CN', { hour12: false });
+        }
+
+        // 生成唯一标识符 (时间戳 + 随机数)
+        function generateMsgId() {
+            return Date.now().toString() + "-" + Math.floor(Math.random() * 1000);
+        }
+
+        // 渲染消息气泡
+        function renderMessage(sender, text, isMe, msgId) {
+            const box = document.getElementById("chatBox");
+            const timeStr = getCurrentTime();
+            const avatarChar = sender.charAt(0).toUpperCase(); 
+
+            // 如果是我发的消息，加一个 span 用来显示状态，ID 设为 msgId 以便后续查找替换
+            const statusHtml = isMe ? `<span id="status-${msgId}" style="font-size: 12px; color: gray; margin-left: 5px;">[已发送]</span>` : '';
+
+            // 动态生成 HTML 结构
+            const html = `
+                <div class="msg-row ${isMe ? 'row-me' : 'row-other'}">
+                    ${!isMe ? `<div class="text-avatar">${avatarChar}</div>` : ''}
+                    <div class="msg-content">
+                        <div class="meta-text">${sender} · ${timeStr} ${statusHtml}</div>
+                        <div class="bubble">${text}</div>
+                    </div>
+                    ${isMe ? `<div class="text-avatar">${avatarChar}</div>` : ''}
+                </div>
+            `;
+            box.insertAdjacentHTML('beforeend', html);
+            box.scrollTop = box.scrollHeight; // 自动滚到底部
+        }
+
+        function login() {
+            currentUser = document.getElementById("myUsername").value;
+            if (!currentUser) return alert("请输入名字！");
+
+            ws = new WebSocket("ws://127.0.0.1:8080");
+
+            ws.onopen = function() {
+                document.getElementById("loginArea").style.display = "none";
+                document.getElementById("chatArea").style.display = "flex";
+                document.getElementById("headerName").innerText = "当前用户: " + currentUser;
+                
+                // 发送登录协议
+                ws.send(JSON.stringify({ type: 1, from: currentUser }));
+            };
+
+            ws.onmessage = function(event) {
+                const data = JSON.parse(event.data);
+                
+                // 1. 收到别人发来的聊天消息
+                if (data.type === 2 && data.from !== currentUser) {
+                    renderMessage(data.from, data.msg, false, data.msgId);
+                    
+                    // ⭐ 核心逻辑：收到消息后，立刻向服务端回复 ACK！
+                    const ackPacket = { 
+                        type: 4, 
+                        from: currentUser, 
+                        to: data.from, 
+                        msgId: data.msgId 
+                    };
+                    ws.send(JSON.stringify(ackPacket));
+                }
+                
+                // 2. 收到别人确认的 ACK 消息
+                else if (data.type === 4) {
+                    // 找到对应的界面元素，把 "[已发送]" 改成 "[已读]"，并改变颜色
+                    const statusSpan = document.getElementById(`status-${data.msgId}`);
+                    if (statusSpan) {
+                        statusSpan.innerText = "[已读]";
+                        statusSpan.style.color = "#52c41a"; // 变成绿色
+                    }
+                }
+            };
+        }
+
+        function sendMessage() {
+            const to = document.getElementById("targetUser").value;
+            const msg = document.getElementById("msgContent").value;
+            if (!to || !msg) return;
+
+            const msgId = generateMsgId(); // ⭐ 生成唯一 ID
+
+            // 发送给 C++ 底层
+            ws.send(JSON.stringify({ type: 2, from: currentUser, to: to, msg: msg, msgId: msgId }));
+            
+            // 在自己的界面渲染 (自己发的消息，初始状态是 [已发送])
+            renderMessage(currentUser, msg, true, msgId);
+            
+            document.getElementById("msgContent").value = "";
+        }
+    </script>
+</body>
+</html>
