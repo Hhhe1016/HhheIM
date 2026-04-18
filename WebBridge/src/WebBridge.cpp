@@ -10,7 +10,9 @@ WebBridge::WebBridge(QObject* parent) : QObject(parent)
 
 	// 当底层收到公网消息时，触发桥接层的槽函数
 	connect(m_core, &IMCore::chatMessageReceived, this, &WebBridge::onChatMessageReceived);
+
 	connect(m_core, &IMCore::ackReceived, this, &WebBridge::onAckReceived);
+	connect(m_core, &IMCore::messageSendFailed, this, &WebBridge::onMessageSendFailed);
 
 	// 启动本地 WebSocket 服务器供网页调用
 	m_webSocketServer = new QWebSocketServer(QStringLiteral("WebBridge Server"), QWebSocketServer::NonSecureMode, this);
@@ -121,4 +123,21 @@ void WebBridge::onAckReceived(const QString& from, const QString& msgId)
 	}
 
 	qDebug() << u8"[WebBridge] 已将 ACK(已读回执) 推送给本地网页 UI";
+}
+
+void WebBridge::onMessageSendFailed(const QString& msgId)
+{
+	QJsonObject responseObj;
+	responseObj["type"] = 5; // ⭐ 约定 type: 5 为消息发送失败
+	responseObj["msgId"] = msgId;
+
+	QJsonDocument doc(responseObj);
+	QString jsonStr = QString::fromUtf8(doc.toJson(QJsonDocument::Compact));
+
+	for (int i = 0; i < m_clientSockets.size(); ++i) {
+		QWebSocket* client = m_clientSockets.at(i);
+		if (client && client->state() == QAbstractSocket::ConnectedState) {
+			client->sendTextMessage(jsonStr);
+		}
+	}
 }

@@ -2,11 +2,59 @@
 import struct
 import json
 import threading
+import time
 
-# 全局字典，用于存储所有在线用户的映射关系：{"username": socket_connection}
+# --- 全局状态记录 ---
 connected_clients = {}
-# 线程锁，防止多线程同时读写字典导致崩溃
 clients_lock = threading.Lock()
+
+# --- QoS (服务质量保障) 核心组件 ---
+offline_messages = {}  # 离线消息队列: {"UserB": [msg_dict1, msg_dict2]}
+unacked_messages = {}  # 未确认消息池: {"msgId": {"msg": dict, "timestamp": float, "retries": int}}
+qos_lock = threading.Lock() # QoS 专属线程锁
+
+# 辅助函数：统一处理封包和发送逻辑
+def send_msg_to_client(conn, msg_dict):
+    try:
+        body = json.dumps(msg_dict).encode('utf-8')
+        header = struct.pack('>I', len(body))
+        conn.sendall(header + body)
+        return True
+    except Exception as e:
+        print(f"[-] 发送数据失败: {e}")
+        return False
+
+# ⭐ 新增：后台超时重传引擎 (独立线程运行)
+def qos_worker():
+    while True:
+        time.sleep(2) # 每 2 秒巡视一次
+        current_time = time.time()
+        
+        with qos_lock:
+            # 遍历所有未收到 ACK 的消息
+            for msg_id, info in list(unacked_messages.items()):
+                # 如果发出去超过 5 秒还没收到 ACK
+                if current_time - info["timestamp"] > 5.0:
+                    if info["retries"] < 3: # 最大重传 3 次
+                        info["retries"] += 1
+                        info["timestamp"] = current_time # 重置倒计时
+                        target = info["msg"].get("to")
+                        print(f"[QoS重传] 消息 [{msg_id}] 疑似丢失，正在进行第 {info['retries']} 次重发给 {target}")
+                        
+                        # 尝试重发
+                        with clients_lock:
+                            target_conn = connected_clients.get(target)
+                        if target_conn:
+                            send_msg_to_client(target_conn, info["msg"])
+                    else:
+                        # 超过 3 次都没回音，认定对方彻底掉线
+                        target = info["msg"].get("to")
+                        print(f"[QoS放弃] 消息 [{msg_id}] 连续 3 次重发失败，转入离线队列等待 {target} 上线。")
+                        if target not in offline_messages:
+                            offline_messages[target] = []
+                        offline_messages[target].append(info["msg"])
+                        # 从待确认池中移除
+                        del unacked_messages[msg_id]
 
 def handle_client(conn, addr):
     print(f"[+] 接受来自 {addr} 的新连接")
@@ -14,88 +62,109 @@ def handle_client(conn, addr):
     
     try:
         while True:
-            # 1. 读取 4 字节包头
             header = conn.recv(4)
-            if not header:
-                break
+            if not header: break
             msg_length = struct.unpack('>I', header)[0]
-            
-            # 2. 读取 JSON 包体
             body = conn.recv(msg_length)
             data = json.loads(body.decode('utf-8'))
             
             msg_type = data.get("type")
             sender = data.get("from")
 
-            # --- 业务逻辑分发 ---
-            
-            # 类型 1：处理登录请求
+            # --- 类型 1：登录请求 ---
             if msg_type == 1:
                 with clients_lock:
                     connected_clients[sender] = conn
                 current_user = sender
                 print(f"[*] 用户上线: {sender}. 当前在线人数: {len(connected_clients)}")
+                
+                # ⭐ 登录成功后，检查有没有他的离线消息
+                with qos_lock:
+                    if sender in offline_messages and offline_messages[sender]:
+                        print(f"[*] 发现 {sender} 的离线消息，正在疯狂推送...")
+                        for offline_msg in offline_messages[sender]:
+                            # 推送离线消息
+                            send_msg_to_client(conn, offline_msg)
+                            # 推送完不能不管，也要扔进未确认池子里监控起来！
+                            unacked_messages[offline_msg['msgId']] = {
+                                "msg": offline_msg,
+                                "timestamp": time.time(),
+                                "retries": 0
+                            }
+                        # 推送完清空该用户的离线队列
+                        offline_messages[sender] = []
 
-            # 类型 2：处理聊天消息转发
+            # --- 类型 2：聊天消息 ---
             elif msg_type == 2:
                 target = data.get("to")
+                msg_id = data.get("msgId")
                 print(f"[-] 收到转发请求: {sender} -> {target}, 内容: {data.get('msg')}")
                 
                 with clients_lock:
                     target_conn = connected_clients.get(target)
                 
-                if target_conn:
-                    # 如果目标在线，原封不动地把收到的二进制数据包（头+体）转发过去
-                    response_header = struct.pack('>I', len(body))
-                    target_conn.sendall(response_header + body)
-                    print(f"    [成功] 已转发给 {target}")
-                else:
-                    # 目标不在线 (这里未来可以结合你的“离线消息落库”需求进行扩展)
-                    print(f"    [失败] 用户 {target} 不在线")
+                with qos_lock:
+                    if target_conn:
+                        # 1. 目标在线：直接发送
+                        send_msg_to_client(target_conn, data)
+                        # 2. 扔进未确认池子，开始计时
+                        unacked_messages[msg_id] = {
+                            "msg": data,
+                            "timestamp": time.time(),
+                            "retries": 0
+                        }
+                        print(f"    [追踪] 消息 [{msg_id}] 已发送给 {target}，等待 ACK...")
+                    else:
+                        # 3. 目标不在线：直接存入离线队列
+                        if target not in offline_messages:
+                            offline_messages[target] = []
+                        offline_messages[target].append(data)
+                        print(f"    [暂存] 用户 {target} 不在线，消息 [{msg_id}] 已存入离线队列")
+
+            # --- 类型 3：心跳包 ---
             elif msg_type == 3:
-                print(f"[♥] 扑通! 收到 {sender} 的心跳包，连接正常活跃中...")
-                
+                pass # 生产环境中这里不打印，防止刷屏
+
+            # --- 类型 4：已读回执 (ACK) ---
             elif msg_type == 4:
                 msg_id = data.get("msgId")
-                target = data.get("to")
-                # 1. 服务端核心逻辑：确认消息送达！
-                print(f"[ACK] 质检通过: 用户 {sender} 已成功接收消息 [{msg_id}]")
-                # （注：未来如果加了数据库，这里就是执行 DELETE 离线消息的操作）
-
+                target = data.get("to") # ACK的发件人变成了收件人
+                
+                # 1. 服务端收到 ACK，将消息从监控池中安全移除
+                with qos_lock:
+                    if msg_id in unacked_messages:
+                        del unacked_messages[msg_id]
+                        print(f"[ACK] 质检通过: {sender} 确认收到消息 [{msg_id}]，解除追踪。")
+                
+                # 2. 把 ACK 转发给真正的发件人，让他的 UI 变绿
                 with clients_lock:
                     target_conn = connected_clients.get(target)
-                
                 if target_conn:
-                    response_header = struct.pack('>I', len(body))
-                    target_conn.sendall(response_header + body)
-                    
-    except ConnectionResetError:
-        print(f"[-] {addr} 异常断开连接。")
+                    send_msg_to_client(target_conn, data)
+
     except Exception as e:
-        print(f"[-] 处理 {addr} 时发生错误: {e}")
+        print(f"[-] {addr} 异常断开: {e}")
     finally:
-        # 客户端断开时，将其从全局字典中清理掉
         if current_user:
             with clients_lock:
                 if current_user in connected_clients:
                     del connected_clients[current_user]
-            print(f"[*] 用户下线: {current_user}. 当前在线人数: {len(connected_clients)}")
+            print(f"[*] 用户下线: {current_user}")
         conn.close()
 
 def start_im_server(host='127.0.0.1', port=8888):
-    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.bind((host, port))
-    server.listen(10) # 支持最大等待连接数
-    print(f"[*] Python IM 路由服务器已启动，监听 {host}:{port}...")
+    # 启动后台 QoS 质检员线程
+    threading.Thread(target=qos_worker, daemon=True).start()
 
-    # 主循环：不断接受新连接并分配线程
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind((host, port))
+    server.listen(10)
+    print(f"[*] Python 增强型 IM 路由服务器已启动，监听 {host}:{port}...")
+
     while True:
         conn, addr = server.accept()
-        # 为每一个接入的客户端启动一个独立的线程
-        thread = threading.Thread(target=handle_client, args=(conn, addr))
-        # 设置为守护线程，主程序退出时子线程自动结束
-        thread.daemon = True 
-        thread.start()
+        threading.Thread(target=handle_client, args=(conn, addr), daemon=True).start()
 
 if __name__ == "__main__":
     start_im_server()

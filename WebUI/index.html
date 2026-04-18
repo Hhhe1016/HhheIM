@@ -146,6 +146,14 @@
                         statusSpan.style.color = "#52c41a"; // 变成绿色
                     }
                 }
+				else if (data.type === 5) {
+                const statusSpan = document.getElementById(`status-${data.msgId}`);
+                if (statusSpan) {
+                    statusSpan.innerText = "[发送失败!]";
+                    statusSpan.style.color = "red"; // 变成红色警告
+                    statusSpan.style.fontWeight = "bold";
+                }
+            }
             };
         }
 

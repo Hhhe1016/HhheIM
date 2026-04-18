@@ -6,12 +6,16 @@ IMCore::IMCore(QObject* parent) : QObject(parent)
 {
 	m_socket = new QTcpSocket(this);
 	m_heartbeatTimer = new QTimer(this);
+	m_qosTimer = new QTimer(this);
 	
 	// 绑定 Socket 的信号到我们的槽函数
 	connect(m_socket, &QTcpSocket::connected, this, &IMCore::onConnected);
 	connect(m_socket, &QTcpSocket::disconnected, this, &IMCore::onDisconnected);
 	connect(m_socket, &QTcpSocket::readyRead, this, &IMCore::onReadyRead);
 	connect(m_heartbeatTimer, &QTimer::timeout, this, &IMCore::sendHeartbeat);
+	connect(m_qosTimer, &QTimer::timeout, this, &IMCore::checkQoSTimeout);
+
+	m_qosTimer->start(2000);
 }
 
 void IMCore::connectToServer(const QString& ip, quint16 port)
@@ -26,7 +30,7 @@ void IMCore::login(const QString& username)
 		return;
 
 	m_currentUser = username;
-	m_heartbeatTimer->start(5000);
+	m_heartbeatTimer->start(30000);
 
 	QJsonObject jsonObj;
 	jsonObj["type"] = 1; // 标明这是登录请求
@@ -81,27 +85,33 @@ void IMCore::sendChatMessage(const QString& from, const QString& to, const QStri
 	// 2. 封包：使用 QDataStream 写入 4 字节长度（默认大端序），再写入 JSON
 	QByteArray packet;
 	QDataStream out(&packet, QIODevice::WriteOnly);
-	out.setVersion(QDataStream::Qt_5_0); // 统一版本
+	out.setVersion(QDataStream::Qt_5_0);
 
 	// 写入 32 位无符号整数表示长度
 	out << (quint32)jsonData.size();
-
-	// 直接追加 JSON 的裸字节（不要用 out << jsonData，因为 Qt 会额外加上它自己的字节头）
 	packet.append(jsonData);
 
 	// 3. 发送
 	m_socket->write(packet);
 	m_socket->flush();
 	qDebug() << "Sent packet length:" << packet.size() << "Data:" << jsonData;
+	//4. 本地包进入QoS池。监控
+	QoSPacket qosPack;
+	qosPack.rawPacket = packet;
+	qosPack.timestamp = QDateTime::currentMSecsSinceEpoch();
+	qosPack.retries = 0;
+	m_unackedMessages.insert(msgId, qosPack);
+
+	m_heartbeatTimer->start(30000);
 }
 
 
 void IMCore::onReadyRead()
 {
-	// 1. 将网卡刚收到的数据全部追加到我们的缓存区中
+	m_heartbeatTimer->start(30000);
 	m_buffer.append(m_socket->readAll());
 
-	// 2. 循环处理缓存区，直到不够拼出一个完整的包
+	// 循环处理缓存区，直到不够拼出一个完整的包
 	while (true)
 	{
 		// 步骤 A：检查是否够读取 4 字节的包头
@@ -142,6 +152,9 @@ void IMCore::onReadyRead()
 			else if (type == 4) {
 				QString from = obj["from"].toString();
 				QString msgId = obj["msgId"].toString();
+
+				m_unackedMessages.remove(msgId);
+				qDebug() << u8"[IMCore] 收到已读回执，解除追踪 - MsgId:" << msgId;
 				emit ackReceived(from, msgId);
 			}
 		}
@@ -192,4 +205,42 @@ void IMCore::sendAck(const QString& from, const QString& to, const QString& msgI
 	packet.append(jsonData);
 	m_socket->write(packet);
 	m_socket->flush();
+
+	m_heartbeatTimer->start(30000);
+}
+
+void IMCore::checkQoSTimeout()
+{
+	if (m_unackedMessages.isEmpty()) return;
+
+	qint64 now = QDateTime::currentMSecsSinceEpoch();
+
+	// 遍历所有尚未收到 ACK 的消息
+	QMutableHashIterator<QString, QoSPacket> i(m_unackedMessages);
+	while (i.hasNext()) {
+		i.next();
+		// 如果发出去超过 5 秒 (5000 毫秒) 还没动静
+		if (now - i.value().timestamp > 5000) {
+			if (i.value().retries < 3) {
+				// 重传次数 < 3：进行重传
+				i.value().retries += 1;
+				i.value().timestamp = now; // 重置计时器
+
+				if (m_socket->state() == QAbstractSocket::ConnectedState) {
+					m_socket->write(i.value().rawPacket);
+					m_socket->flush();
+					qDebug() << "[IMCore QoS] 疑似丢包，正在进行第" << i.value().retries << "次重传 MsgId:" << i.key();
+				}
+			}
+			else {
+				// 重传 3 次依然失败，彻底放弃
+				qWarning() << "[IMCore QoS] 连续 3 次重传失败，判定消息发送失败 MsgId:" << i.key();
+
+				// ⭐ 核心解耦点：抛出失败信号，不直接操作 UI！未来 Qt 界面绑定这个信号即可。
+				emit messageSendFailed(i.key());
+
+				i.remove(); // 从池中移除
+			}
+		}
+	}
 }
