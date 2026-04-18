@@ -1,6 +1,5 @@
 ﻿#include "IMCore.h"
-#include <QDebug>
-#include <QDataStream>
+
 
 IMCore::IMCore(QObject* parent) : QObject(parent)
 {
@@ -26,27 +25,12 @@ void IMCore::connectToServer(const QString& ip, quint16 port)
 
 void IMCore::login(const QString& username)
 {
-	if (m_socket->state() != QAbstractSocket::ConnectedState) 
-		return;
-
 	m_currentUser = username;
 	m_heartbeatTimer->start(30000);
 
-	QJsonObject jsonObj;
-	jsonObj["type"] = 1; // 标明这是登录请求
-	jsonObj["from"] = username;
-
-	QJsonDocument doc(jsonObj);
-	QByteArray jsonData = doc.toJson(QJsonDocument::Compact);
-
-	QByteArray packet;
-	QDataStream out(&packet, QIODevice::WriteOnly);
-	out.setVersion(QDataStream::Qt_5_0);
-	out << (quint32)jsonData.size();
-	packet.append(jsonData);
-
-	m_socket->write(packet);
-	m_socket->flush();
+	LoginPacket loginPack;
+	loginPack.username = username;
+	sendJsonPacket(loginPack.toJson());
 }
 
 void IMCore::onConnected()
@@ -65,42 +49,16 @@ void IMCore::onDisconnected()
 // ==========================================
 // ⭐ 核心封包逻辑：[4字节长度] + [JSON数据]
 // ==========================================
-void IMCore::sendChatMessage(const QString& from, const QString& to, const QString& msg, const QString& msgId)
+void IMCore::sendChatMessage(const ChatPacket& packet)
 {
-	if (m_socket->state() != QAbstractSocket::ConnectedState) {
-		qWarning() << "Socket is not connected!";
-		return;
-	}
-
-	// 1. 组装 JSON
-	QJsonObject jsonObj;
-	jsonObj["type"] = 2;
-	jsonObj["from"] = from;
-	jsonObj["to"] = to;
-	jsonObj["msg"] = msg;
-	jsonObj["msgId"] = msgId;
-	QJsonDocument doc(jsonObj);
-	QByteArray jsonData = doc.toJson(QJsonDocument::Compact); // 转为紧凑型 JSON 字节流
-
-	// 2. 封包：使用 QDataStream 写入 4 字节长度（默认大端序），再写入 JSON
-	QByteArray packet;
-	QDataStream out(&packet, QIODevice::WriteOnly);
-	out.setVersion(QDataStream::Qt_5_0);
-
-	// 写入 32 位无符号整数表示长度
-	out << (quint32)jsonData.size();
-	packet.append(jsonData);
-
-	// 3. 发送
-	m_socket->write(packet);
-	m_socket->flush();
-	qDebug() << "Sent packet length:" << packet.size() << "Data:" << jsonData;
-	//4. 本地包进入QoS池。监控
+	QByteArray rawPacket = sendJsonPacket(packet.toJson());
+	if (rawPacket.isEmpty()) return;
+	// 本地包进入QoS池。监控
 	QoSPacket qosPack;
-	qosPack.rawPacket = packet;
+	qosPack.rawPacket = rawPacket;
 	qosPack.timestamp = QDateTime::currentMSecsSinceEpoch();
 	qosPack.retries = 0;
-	m_unackedMessages.insert(msgId, qosPack);
+	m_unackedMessages.insert(packet.msgId, qosPack);
 
 	m_heartbeatTimer->start(30000);
 }
@@ -141,21 +99,25 @@ void IMCore::onReadyRead()
 		QJsonDocument doc = QJsonDocument::fromJson(jsonData, &error);
 		if (error.error == QJsonParseError::NoError && doc.isObject()) {
 			QJsonObject obj = doc.object();
-			int type = obj["type"].toInt();
-			if (type == 2) {
-				QString from = obj["from"].toString();
-				QString msg = obj["msg"].toString();
-				QString msgId = obj["msgId"].toString();
-				emit chatMessageReceived(from, msg, msgId);
-				qDebug() << "Parsed incoming message - From:" << from << "Msg:" << msg;
-			}
-			else if (type == 4) {
-				QString from = obj["from"].toString();
-				QString msgId = obj["msgId"].toString();
+			int typeValue = obj["type"].toInt();
+			MsgType type = static_cast<MsgType>(typeValue);
 
-				m_unackedMessages.remove(msgId);
-				qDebug() << u8"[IMCore] 收到已读回执，解除追踪 - MsgId:" << msgId;
-				emit ackReceived(from, msgId);
+			if (type == MsgType::Chat) {
+				ChatPacket packet;
+				packet.from = obj["from"].toString();
+				packet.msg = obj["msg"].toString();
+				packet.msgId = obj["msgId"].toString();
+				emit chatMessageReceived(packet.from, packet.msg, packet.msgId);
+				qDebug() << u8"解析了消息，来自:" << packet.from << "Msg:" << packet.msg;
+			}
+			else if (type == MsgType::Ack) {
+				AckPacket packet;
+				packet.from = obj["from"].toString();
+				packet.msgId = obj["msgId"].toString();
+
+				m_unackedMessages.remove(packet.msgId);
+				qDebug() << u8"[IMCore] 收到已读回执，解除追踪 - MsgId:" << packet.msgId;
+				emit ackReceived(packet.from, packet.msgId);
 			}
 		}
 	}
@@ -168,43 +130,16 @@ void IMCore::sendHeartbeat()
 		return;
 	}
 
-	QJsonObject jsonObj;
-	jsonObj["type"] = 3; // 标明这是心跳包
-	jsonObj["from"] = m_currentUser;
+	HeartbeatPacket pack;
+	pack.from = m_currentUser;
+	sendJsonPacket(pack.toJson());
 
-	QJsonDocument doc(jsonObj);
-	QByteArray jsonData = doc.toJson(QJsonDocument::Compact);
-
-	QByteArray packet;
-	QDataStream out(&packet, QIODevice::WriteOnly);
-	out.setVersion(QDataStream::Qt_5_0);
-	out << (quint32)jsonData.size();
-	packet.append(jsonData);
-
-	m_socket->write(packet);
-	m_socket->flush();
-
-	qDebug() << u8"[IMCore] 发送了一次心跳包 -> Type 3";
+	qDebug() << u8"[IMCore] 发送了一次心跳包 -> Type: Heartbeat";
 }
 
-void IMCore::sendAck(const QString& from, const QString& to, const QString& msgId)
+void IMCore::sendAck(const AckPacket& packet)
 {
-	if (m_socket->state() != QAbstractSocket::ConnectedState) return;
-	QJsonObject jsonObj;
-	jsonObj["type"] = 4;
-	jsonObj["from"] = from;
-	jsonObj["to"] = to;
-	jsonObj["msgId"] = msgId;
-
-	QJsonDocument doc(jsonObj);
-	QByteArray jsonData = doc.toJson(QJsonDocument::Compact);
-	QByteArray packet;
-	QDataStream out(&packet, QIODevice::WriteOnly);
-	out.setVersion(QDataStream::Qt_5_0);
-	out << (quint32)jsonData.size();
-	packet.append(jsonData);
-	m_socket->write(packet);
-	m_socket->flush();
+	sendJsonPacket(packet.toJson());
 
 	m_heartbeatTimer->start(30000);
 }
@@ -243,4 +178,28 @@ void IMCore::checkQoSTimeout()
 			}
 		}
 	}
+}
+
+QByteArray IMCore::sendJsonPacket(const QJsonObject& jsonObj)
+{
+	if (m_socket->state() != QAbstractSocket::ConnectedState) {
+		qWarning() << u8"Socket is not connected!";
+		return QByteArray(); // 未连接时返回空
+	}
+
+	QJsonDocument doc(jsonObj);
+	QByteArray jsonData = doc.toJson(QJsonDocument::Compact);
+
+	QByteArray rawPacket;
+	QDataStream out(&rawPacket, QIODevice::WriteOnly);
+	out.setVersion(QDataStream::Qt_5_0);
+	out << (quint32)jsonData.size();
+	rawPacket.append(jsonData);
+
+	// 发送数据
+	m_socket->write(rawPacket);
+	m_socket->flush();
+
+	// ⭐ 核心魔法：把封好的二进制包返回出去，给 QoS 留个底！
+	return rawPacket;
 }

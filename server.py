@@ -3,6 +3,15 @@ import struct
 import json
 import threading
 import time
+from enum import IntEnum
+
+# ⭐ 新增：定义与 C++ 完全一致的强类型枚举
+class MsgType(IntEnum):
+    Login = 1
+    Chat = 2
+    Heartbeat = 3
+    Ack = 4
+    SendFailed = 5
 
 # --- 全局状态记录 ---
 connected_clients = {}
@@ -24,7 +33,7 @@ def send_msg_to_client(conn, msg_dict):
         print(f"[-] 发送数据失败: {e}")
         return False
 
-# ⭐ 新增：后台超时重传引擎 (独立线程运行)
+# 后台超时重传引擎 (独立线程运行)
 def qos_worker():
     while True:
         time.sleep(2) # 每 2 秒巡视一次
@@ -68,17 +77,25 @@ def handle_client(conn, addr):
             body = conn.recv(msg_length)
             data = json.loads(body.decode('utf-8'))
             
-            msg_type = data.get("type")
+            # ⭐ 安全提取类型，并转为枚举以防未知数字
+            raw_type = data.get("type")
+            try:
+                msg_type = MsgType(raw_type)
+            except ValueError:
+                print(f"[-] 收到未知或非法的消息类型: {raw_type}")
+                continue
+
             sender = data.get("from")
 
+            # ⭐ 彻底消灭魔法数字，使用极其清晰的枚举判断
             # --- 类型 1：登录请求 ---
-            if msg_type == 1:
+            if msg_type == MsgType.Login:
                 with clients_lock:
                     connected_clients[sender] = conn
                 current_user = sender
                 print(f"[*] 用户上线: {sender}. 当前在线人数: {len(connected_clients)}")
                 
-                # ⭐ 登录成功后，检查有没有他的离线消息
+                # 登录成功后，检查有没有他的离线消息
                 with qos_lock:
                     if sender in offline_messages and offline_messages[sender]:
                         print(f"[*] 发现 {sender} 的离线消息，正在疯狂推送...")
@@ -95,7 +112,7 @@ def handle_client(conn, addr):
                         offline_messages[sender] = []
 
             # --- 类型 2：聊天消息 ---
-            elif msg_type == 2:
+            elif msg_type == MsgType.Chat:
                 target = data.get("to")
                 msg_id = data.get("msgId")
                 print(f"[-] 收到转发请求: {sender} -> {target}, 内容: {data.get('msg')}")
@@ -122,11 +139,11 @@ def handle_client(conn, addr):
                         print(f"    [暂存] 用户 {target} 不在线，消息 [{msg_id}] 已存入离线队列")
 
             # --- 类型 3：心跳包 ---
-            elif msg_type == 3:
+            elif msg_type == MsgType.Heartbeat:
                 pass # 生产环境中这里不打印，防止刷屏
 
             # --- 类型 4：已读回执 (ACK) ---
-            elif msg_type == 4:
+            elif msg_type == MsgType.Ack:
                 msg_id = data.get("msgId")
                 target = data.get("to") # ACK的发件人变成了收件人
                 

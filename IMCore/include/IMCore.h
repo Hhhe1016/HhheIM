@@ -1,13 +1,68 @@
 ﻿#pragma once
 
-#include <QObject>
-#include <QTcpSocket>
-#include <QByteArray>
-#include <QJsonObject>
-#include <QJsonDocument>
-#include <QTimer>
-#include <QHash>
-#include <QDateTime>
+#include "stdafx.h"
+
+// 协议枚举类型
+enum class MsgType : uint8_t {
+	Login = 1,
+	Chat = 2,
+	Heartbeat = 3,
+	Ack = 4,
+	SendFailed = 5
+};
+
+struct LoginPacket {
+	QString username;
+
+	QJsonObject toJson() const {
+		QJsonObject obj;
+		obj["type"] = static_cast<int>(MsgType::Login);
+		obj["from"] = username;
+		return obj;
+	}
+};
+
+struct ChatPacket {
+	QString from;
+	QString to;
+	QString msg;
+	QString msgId;
+
+	QJsonObject toJson() const {
+		QJsonObject obj;
+		obj["type"] = static_cast<int>(MsgType::Chat);
+		obj["from"] = from;
+		obj["to"] = to;
+		obj["msg"] = msg;
+		obj["msgId"] = msgId;
+		return obj;
+	}
+};
+
+struct AckPacket {
+	QString from;
+	QString to;
+	QString msgId;
+
+	QJsonObject toJson() const {
+		QJsonObject obj;
+		obj["type"] = static_cast<int>(MsgType::Ack);
+		obj["from"] = from;
+		obj["to"] = to;
+		obj["msgId"] = msgId;
+		return obj;
+	}
+};
+
+struct HeartbeatPacket {
+	QString from;
+	QJsonObject toJson() const {
+		QJsonObject obj;
+		obj["type"] = static_cast<int>(MsgType::Heartbeat);
+		obj["from"] = from;
+		return obj;
+	}
+};
 
 struct QoSPacket {
 	QByteArray rawPacket; // 打包好带有 4 字节头的原始二进制流
@@ -23,8 +78,8 @@ public:
 
 	void connectToServer(const QString& ip, quint16 port);
 	void login(const QString& username);
-	void sendChatMessage(const QString& from, const QString& to, const QString& msg, const QString& msgId);
-	void sendAck(const QString& from, const QString& to, const QString& msgId);
+	void sendChatMessage(const ChatPacket& packet);
+	void sendAck(const AckPacket& packet);
 
 signals:
 	// 收到完整消息时触发此信号
@@ -39,7 +94,8 @@ private slots:
 	void onDisconnected();
 	void sendHeartbeat();
 	void checkQoSTimeout();
-
+private:
+	QByteArray sendJsonPacket(const QJsonObject& jsonObj);
 private:
 	QTcpSocket* m_socket;
 	QByteArray m_buffer; // 核心缓存区，用于处理粘包和半包

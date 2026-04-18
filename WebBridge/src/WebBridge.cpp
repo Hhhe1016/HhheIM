@@ -17,7 +17,7 @@ WebBridge::WebBridge(QObject* parent) : QObject(parent)
 	// 启动本地 WebSocket 服务器供网页调用
 	m_webSocketServer = new QWebSocketServer(QStringLiteral("WebBridge Server"), QWebSocketServer::NonSecureMode, this);
 	if (m_webSocketServer->listen(QHostAddress::LocalHost, 8080)) {
-		qDebug() << u8"[WebBridge] 本地 WebSocket 服务已启动: ws://127.0.0.1:8888";
+		qDebug() << u8"[WebBridge] 本地 WebSocket 服务已启动: ws://127.0.0.1:8080";
 		connect(m_webSocketServer, &QWebSocketServer::newConnection, this, &WebBridge::onNewConnection);
 	}
 }
@@ -52,34 +52,38 @@ void WebBridge::onTextMessageReceived(QString message)
 		return;
 
 	QJsonObject obj = doc.object();
-	int type = obj["type"].toInt();
+	int typeValue = obj["type"].toInt();
+	MsgType type = static_cast<MsgType>(typeValue);
 
 	// 向下桥接：将网页指令翻译为 C++ 内核函数的调用
-	if (type == 1) {
+	if (type == MsgType::Login) {
 		// 登录请求
-		QString from = obj["from"].toString();
-		m_core->login(from);
+		LoginPacket packet;
+		packet.username = obj["from"].toString();
+		m_core->login(packet.username);
 	}
-	else if (type == 2) {
+	else if (type == MsgType::Chat) {
 		// 聊天消息
-		QString from = obj["from"].toString();
-		QString to = obj["to"].toString();
-		QString msg = obj["msg"].toString();
-		QString msgId = obj["msgId"].toString();
-		m_core->sendChatMessage(from, to, msg, msgId);
+		ChatPacket packet;
+		packet.from = obj["from"].toString();
+		packet.to = obj["to"].toString();
+		packet.msg = obj["msg"].toString();
+		packet.msgId = obj["msgId"].toString();
+		m_core->sendChatMessage(packet);
 	}
-	else if (type == 4) { // 网页前端收到消息后，发回来的 ACK
-		QString from = obj["from"].toString();
-		QString to = obj["to"].toString();
-		QString msgId = obj["msgId"].toString();
-		m_core->sendAck(from, to, msgId);
+	else if (type == MsgType::Ack) { // 网页前端收到消息后，发回来的 ACK
+		AckPacket packet;
+		packet.from = obj["from"].toString();
+		packet.to = obj["to"].toString();
+		packet.msgId = obj["msgId"].toString();
+		m_core->sendAck(packet);
 	}
 }
 
 void WebBridge::onChatMessageReceived(const QString& from, const QString& msg, const QString& msgId)
 {
 	QJsonObject responseObj;
-	responseObj["type"] = 2;
+	responseObj["type"] = static_cast<int>(MsgType::Chat);
 	responseObj["from"] = from;
 	responseObj["msg"] = msg;
 	responseObj["msgId"] = msgId;
@@ -107,7 +111,7 @@ void WebBridge::onAckReceived(const QString& from, const QString& msgId)
 {
 	// 1. 组装发给网页的 JSON 指令
 	QJsonObject responseObj;
-	responseObj["type"] = 4;
+	responseObj["type"] = static_cast<int>(MsgType::Ack);;
 	responseObj["from"] = from;
 	responseObj["msgId"] = msgId;
 
@@ -128,7 +132,7 @@ void WebBridge::onAckReceived(const QString& from, const QString& msgId)
 void WebBridge::onMessageSendFailed(const QString& msgId)
 {
 	QJsonObject responseObj;
-	responseObj["type"] = 5; // ⭐ 约定 type: 5 为消息发送失败
+	responseObj["type"] = static_cast<int>(MsgType::SendFailed); // ⭐ 约定 type: 5 为消息发送失败
 	responseObj["msgId"] = msgId;
 
 	QJsonDocument doc(responseObj);
