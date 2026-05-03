@@ -98,7 +98,6 @@ private:
 	QByteArray sendJsonPacket(const QJsonObject& jsonObj);
 private:
 	QTcpSocket* m_socket;
-	QByteArray m_buffer; // 核心缓存区，用于处理粘包和半包
 	QTimer* m_heartbeatTimer;
 	QString m_currentUser;
 	QHash<QString, QoSPacket> m_unackedMessages;  // <msgId, Qos包>

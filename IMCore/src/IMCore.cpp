@@ -67,32 +67,62 @@ void IMCore::sendChatMessage(const ChatPacket& packet)
 void IMCore::onReadyRead()
 {
 	m_heartbeatTimer->start(30000);
-	m_buffer.append(m_socket->readAll());
 
 	// 循环处理缓存区，直到不够拼出一个完整的包
 	while (true)
 	{
 		// 步骤 A：检查是否够读取 4 字节的包头
-		if (m_buffer.size() < 4) {
+		if (m_socket->bytesAvailable() < 8) {
 			break; // 属于半包，跳出循环，等下一次 readyRead
 		}
 
 		// 步骤 B：读取前 4 个字节，解析出包体的真实长度
-		QDataStream in(&m_buffer, QIODevice::ReadOnly);
+		QByteArray headerBytes = m_socket->peek(8);
+		QDataStream in(headerBytes);
 		in.setVersion(QDataStream::Qt_5_0);
+
+		quint16 magicNumber = 0;
+		in >> magicNumber;
+		// ⭐ 滑动窗口核心：检查魔数
+		if (magicNumber != 0x4848) {
+			qWarning() << u8"[IMCore] 魔数不匹配，滑动 1 byte寻找包头";
+			m_socket->read(1); // 真正读出并丢弃 1 个字节，继续向后找
+			continue;
+		}
+
 		quint32 bodyLength = 0;
+		quint16 expectedChecksum = 0;
 		in >> bodyLength;
+		in >> expectedChecksum;
+		if (bodyLength == 0 || bodyLength > 10485760) { // (注: 10MB = 10*1024*1024)。防黑客长包攻击
+			m_socket->disconnectFromHost();
+			return;
+		}
 
 		// 步骤 C：检查缓存区里的数据总长度，是否够一个完整的包 (4 字节头 + 包体长度)
-		if (m_buffer.size() < 4 + bodyLength) {
+		if (m_socket->bytesAvailable() < 8 + bodyLength) {
 			break; // 数据还没收完，继续等
 		}
 
-		// 步骤 D：提取出一个完整的 JSON 数据包！
-		QByteArray jsonData = m_buffer.mid(4, bodyLength);
+		// 步骤 D：精准读取数据并从缓冲区剔除
+		QByteArray fullPacket = m_socket->peek(8 + bodyLength);
+		QByteArray jsonData = fullPacket.mid(8, bodyLength); // 提取包体
 
-		// 步骤 E：将这部分已经处理完的数据从缓存区剔除（前 4 字节 + 包体长度）
-		m_buffer.remove(0, 4 + bodyLength);
+		// 计算一遍校验和
+		quint16 actualChecksum = 0;
+		for (char c : jsonData) {
+			actualChecksum += static_cast<quint8>(c);
+		}
+
+		// 比对校验和
+		if (actualChecksum != expectedChecksum) {
+			qWarning() << u8"[IMCore] 校验和失败！丢弃脏数据，继续滑动寻找";
+			m_socket->read(1);
+			continue;
+		}
+
+		// 步骤 E：魔数和校验和全部通过
+		m_socket->read(8 + bodyLength); 
 
 		// 步骤 F：解析收到的 JSON
 		QJsonParseError error;
@@ -193,7 +223,14 @@ QByteArray IMCore::sendJsonPacket(const QJsonObject& jsonObj)
 	QByteArray rawPacket;
 	QDataStream out(&rawPacket, QIODevice::WriteOnly);
 	out.setVersion(QDataStream::Qt_5_0);
+	// 校验和，取所有字节求和
+	quint16 checksum = 0;
+	for (char c : jsonData) {
+		checksum += static_cast<quint8>(c);
+	}
+	out << (quint16)0x4848;  // 魔数
 	out << (quint32)jsonData.size();
+	out << (quint16)checksum;
 	rawPacket.append(jsonData);
 
 	// 发送数据
