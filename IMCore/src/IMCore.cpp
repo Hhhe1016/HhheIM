@@ -1,4 +1,5 @@
 ﻿#include "IMCore.h"
+#include <QAbstractSocket>
 
 
 IMCore::IMCore(QObject* parent) : QObject(parent)
@@ -11,6 +12,14 @@ IMCore::IMCore(QObject* parent) : QObject(parent)
 	connect(m_socket, &QTcpSocket::connected, this, &IMCore::onConnected);
 	connect(m_socket, &QTcpSocket::disconnected, this, &IMCore::onDisconnected);
 	connect(m_socket, &QTcpSocket::readyRead, this, &IMCore::onReadyRead);
+#if QT_VERSION >= QT_VERSION_CHECK(5, 15, 0)
+	connect(m_socket, &QAbstractSocket::errorOccurred, this, [this](QAbstractSocket::SocketError) {
+		emit connectionError(m_socket->errorString());
+	});
+#else
+	connect(m_socket, QOverload<QAbstractSocket::SocketError>::of(&QAbstractSocket::error), this,
+		[this](QAbstractSocket::SocketError) { emit connectionError(m_socket->errorString()); });
+#endif
 	connect(m_heartbeatTimer, &QTimer::timeout, this, &IMCore::sendHeartbeat);
 	connect(m_qosTimer, &QTimer::timeout, this, &IMCore::checkQoSTimeout);
 
@@ -36,14 +45,14 @@ void IMCore::login(const QString& username)
 void IMCore::onConnected()
 {
 	qDebug() << "Successfully connected to Python Server!";
-	// 连接成功后，我们直接发一条测试消息
-	//sendChatMessage("ClientA", "ClientB", "Hello from C++ Qt Kernel!");
+	emit connectedToServer();
 }
 
 void IMCore::onDisconnected()
 {
 	qDebug() << "Disconnected from server.";
 	m_heartbeatTimer->stop();
+	emit disconnectedFromServer();
 }
 
 // ==========================================

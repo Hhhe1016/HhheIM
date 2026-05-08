@@ -82,6 +82,9 @@ public:
 	void sendAck(const AckPacket& packet);
 
 signals:
+	void connectedToServer();
+	void disconnectedFromServer();
+	void connectionError(const QString& message);
 	// 收到完整消息时触发此信号
 	void chatMessageReceived(const QString& from, const QString& msg, const QString& msgId);
 	void ackReceived(const QString& from, const QString& msgId);
